@@ -26,9 +26,11 @@ declare(strict_types=1);
 namespace OCA\ResticBrowser\Service;
 
 use OCA\ResticBrowser\Exception\ResticException;
+use OCA\ResticBrowser\Util\CacheUtil;
 use OCP\ICache;
 use OCP\ICacheFactory;
 use OCP\Server;
+use Psr\Log\LoggerInterface;
 
 class ResticRepository implements IResticRepository {
     /** @var string */
@@ -40,10 +42,14 @@ class ResticRepository implements IResticRepository {
     /** @var ICache */
     private $cache;
 
+    /** @var LoggerInterface */
+    private $logger;
+
     public function __construct(string $path, string $password) {
         $this->path = $path;
         $this->password = $password;
         $this->cache = Server::get(ICacheFactory::class)->createLocal('restic');
+        $this->logger = Server::get(LoggerInterface::class);
     }
 
     public function getPath(): string {
@@ -51,30 +57,31 @@ class ResticRepository implements IResticRepository {
     }
 
     public function snapshots(): array {
-        $key = "snapshots";
-        if (!$this->cache->get($key)) {
-            $cmd = "snapshots --json";
-            [$stdOut, $stdErr, $returnCode] = $this->executeResticCommand($cmd);
+        // Snapshot numbers can change so only cache for a short period of time
+        return CacheUtil::getCached("snapshots", $this->cache, function() {
+            [$stdOut, $stdErr, $returnCode] = $this->executeResticCommand("snapshots --json");
             $snapshots = json_decode($stdOut, true);
             $result = [];
             foreach ($snapshots as $snapshot) {
                 $result[$snapshot['short_id']] = $snapshot;
             }
-            // Snapshot numbers can change so only cache for
-            // a short period of time
-            $this->cache->set($key, $result, 10);
-        }
-        
-        return $this->cache->get($key);
+
+            return $result;
+        }, 10);
     }
 
-    public function ls(string $snapshotId): array {
+    public function ls(string $snapshotId, string $snapshotPath): array {
         // Snapshots are immutable so we can cache them for quite a long time
-        $key = 'ls-' . $snapshotId;
-        if (!$this->cache->get($key)) {
-            $cmd = 'ls ' . escapeshellarg($snapshotId) . ' --json';
+        return CacheUtil::getCached("ls_$snapshotId"."_$snapshotPath", $this->cache, function() use ($snapshotId, $snapshotPath) {
+            if (strlen($snapshotPath) === 0) {
+                $snapshotPath = '/';
+            }
+            if ($snapshotPath[0] !== '/') {
+                $snapshotPath = '/' . $snapshotPath;
+            }
+            $cmd = 'ls ' . escapeshellarg($snapshotId) . ' ' . escapeshellarg($snapshotPath) . ' --json';
             [$stdOut, $stdErr, $returnCode] = $this->executeResticCommand($cmd);
-            $snapshotObjects =[];
+            $snapshotObjects = [];
             $lineCount = 0;
             foreach (explode("\n", $stdOut) as $line) {
                 // Skip invalid lines
@@ -84,11 +91,11 @@ class ResticRepository implements IResticRepository {
                 $info = json_decode($line, true);
                 $path = $info['path'];
                 $snapshotObjects[$path] = $info;
-            } 
-            $this->cache->set($key, $snapshotObjects);
-        }
-        
-        return $this->cache->get($key);
+            }
+            
+            return $snapshotObjects;
+        });
+
     }
 
     public function dump(string $snapshotId, string $snapshotPath, string $target): void {
@@ -107,6 +114,8 @@ class ResticRepository implements IResticRepository {
         );
         
         $command = 'restic -q -r ' . escapeshellarg($this->path) . ' ' . $commandSuffix;
+
+        $this->logger->debug('Executing command: ' . $command);
 
         try {
             $process = proc_open($command, $descriptorspec, $pipes);
@@ -131,6 +140,10 @@ class ResticRepository implements IResticRepository {
             }
 
             return [$stdOut, $stdErr, $returnCode];
+        }
+        catch (\Throwable $e) {
+            $this->logger->error('Error executing command: ' . $command . '. Error was: ' . $e->getMessage());
+            throw $e;
         }
         finally {
             if (is_resource($pipes[0])) {

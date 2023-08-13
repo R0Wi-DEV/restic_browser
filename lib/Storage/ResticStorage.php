@@ -29,12 +29,13 @@ use Icewind\Streams\IteratorDirectory;
 use OC\Files\Storage\Common;
 use OCA\ResticBrowser\Service\IResticRepository;
 use OCA\ResticBrowser\Service\ResticRepository;
+use OCA\ResticBrowser\Util\CacheUtil;
 use OCP\Files\StorageNotAvailableException;
+use OCP\ICache;
+use OCP\ICacheFactory;
 use OCP\ITempManager;
 use OCP\Server;
 use Psr\Log\LoggerInterface;
-
-use function OCP\Log\logger;
 
 class ResticStorage extends Common {
     private const TYPE_FILE = 0;
@@ -45,18 +46,18 @@ class ResticStorage extends Common {
     private $logger;
     /** @var ITempManager */
     private $tempManager;
+    /** @var ICache */
+    private $resultsCache;
     /** @var IResticRepository */
     private $resticRepository;
-
-    private $snapshotRowsCached = false;
-    private $cachedSnapshotRows = [];
 
     public function __construct($params) {
         $password = $params['password'];
         $path = $params['path'];
         $this->logger = Server::get(LoggerInterface::class);
         $this->tempManager = Server::get(ITempManager::class);
-        $this->resticRepository = new ResticRepository($path, $password); // TODO :: mocking for test
+        $this->resultsCache = Server::get(ICacheFactory::class)->createLocal('restic_storage');
+        $this->resticRepository = new ResticRepository($path, $password);
     }
 
     public function getId() {
@@ -74,23 +75,28 @@ class ResticStorage extends Common {
     }
 
     public function opendir($path) {
-        if ($path === '' || $path === '/') {
-            return $this->listSnapshots();
-        }
-        [$snapshotId, $snapshotSubPath] = $this->parsePath($path);
-        $snapshotSubPathEscaped = str_replace('/', '\/', $snapshotSubPath);
-        // Use a regex which matches the path as prefix and returns
-        // the next path component as group-match
-        $regexFilesInSubPath = "/$snapshotSubPathEscaped\/(.*?)(\/|$)/";
-        $snapshotObjectInfos = $this->resticRepository->ls($snapshotId);
-        foreach ($snapshotObjectInfos as $snapshotObjectInfo) {
-            $snapshotFilePath = $snapshotObjectInfo['path'];
-            $matchingFileOrDirectory = preg_match($regexFilesInSubPath, $snapshotFilePath, $subPathMatch) ? $subPathMatch[1] : null;
-            if ($matchingFileOrDirectory === null) {
-                continue;
+        $key = "opendir_$path";
+        $files = CacheUtil::getCached($key, $this->resultsCache, function () use ($path) {
+            if ($path === '' || $path === '/') {
+                return $this->listSnapshots();
             }
-            $files[] = $matchingFileOrDirectory;
-        }
+            [$snapshotId, $snapshotSubPath] = $this->parsePath($path);
+            $snapshotSubPathEscaped = str_replace('/', '\/', $snapshotSubPath);
+            // Use a regex which matches the path as prefix and returns
+            // the next path component as group-match
+            $regexFilesInSubPath = "/$snapshotSubPathEscaped\/(.*?)(\/|$)/";
+            $snapshotObjectInfos = $this->resticRepository->ls($snapshotId, $snapshotSubPath);
+            foreach ($snapshotObjectInfos as $snapshotObjectInfo) {
+                $snapshotFilePath = $snapshotObjectInfo['path'];
+                $matchingFileOrDirectory = preg_match($regexFilesInSubPath, $snapshotFilePath, $subPathMatch) ? $subPathMatch[1] : null;
+                if ($matchingFileOrDirectory === null) {
+                    continue;
+                }
+                $files[] = $matchingFileOrDirectory;
+            }
+            return $files;
+        });
+
         return IteratorDirectory::wrap($files);
     }
 
@@ -119,35 +125,37 @@ class ResticStorage extends Common {
             return $this->getDefaultStat();
         }
 
-        [$snapshotId, $snapshotSubPath] = $this->parsePath($path);
+        return CacheUtil::getCached("stat_$path", $this->resultsCache, function () use ($path) {
+            [$snapshotId, $snapshotSubPath] = $this->parsePath($path);
 
-        // Snapshot metadata
-        if (empty($snapshotSubPath)) {
-            $snapshots = $this->resticRepository->snapshots();
-            if (!array_key_exists($snapshotId, $snapshots)) {
+            // Snapshot metadata
+            if (empty($snapshotSubPath)) {
+                $snapshots = $this->resticRepository->snapshots();
+                if (!array_key_exists($snapshotId, $snapshots)) {
+                    return $this->getDefaultStat();
+                }
+                $snapshotMeta = $snapshots[$snapshotId];
+                $snapshotTime = strtotime($snapshotMeta['time']);
+                return [
+                    'size' => 0,
+                    'mtime' => $snapshotTime,
+                    'atime' => $snapshotTime
+                ];
+            }
+    
+            // Metadata of backed up file/folder
+            $snapshotObjectInfos = $this->resticRepository->ls($snapshotId, $snapshotSubPath);
+            if (!array_key_exists($snapshotSubPath, $snapshotObjectInfos)) {
                 return $this->getDefaultStat();
             }
-            $snapshotMeta = $snapshots[$snapshotId];
-            $snapshotTime = strtotime($snapshotMeta['time']);
+    
+            $snapshotObjectInfo = $snapshotObjectInfos[$snapshotSubPath];
             return [
-                'size' => 0,
-                'mtime' => $snapshotTime,
-                'atime' => $snapshotTime
+                'size' => intval($snapshotObjectInfo['size']),
+                'mtime' => strtotime($snapshotObjectInfo['mtime']),
+                'atime' => strtotime($snapshotObjectInfo['atime'])
             ];
-        }
-
-        // Metadata of backed up file/folder
-        $snapshotObjectInfos = $this->resticRepository->ls($snapshotId);
-        if (!array_key_exists($snapshotSubPath, $snapshotObjectInfos)) {
-            return $this->getDefaultStat();
-        }
-
-        $snapshotObjectInfo = $snapshotObjectInfos[$snapshotSubPath];
-        return [
-            'size' => intval($snapshotObjectInfo['size']),
-            'mtime' => strtotime($snapshotObjectInfo['mtime']),
-            'atime' => strtotime($snapshotObjectInfo['atime'])
-        ];
+        });
     }
 
     public function filetype($path) {
@@ -200,16 +208,11 @@ class ResticStorage extends Common {
      * @return resource|boolean
      */
     private function listSnapshots() {
-        if ($this->snapshotRowsCached) {
-            return IteratorDirectory::wrap($this->cachedSnapshotRows);
-        }
         $snapshots = $this->resticRepository->snapshots();
-        $this->cachedSnapshotRows = array_map(function($snapshot) {
+        return array_map(function($snapshot) {
             // for example 2023-04-15T23:39:39.095734241+02:00 (52f058e0)
             return $snapshot['time'] . ' (' . $snapshot['short_id'] .')';
         }, $snapshots);
-        $this->snapshotRowsCached = true;
-        return IteratorDirectory::wrap($this->cachedSnapshotRows);
     }
 
     private function parsePath(string $path) : array {
@@ -230,23 +233,26 @@ class ResticStorage extends Common {
         if ($path === '') {
             return self::TYPE_DIR;
         }
-        [$snapshotId, $snapshotSubPath] = $this->parsePath($path);
-        // A snapshot root is always a directory
-        if (empty($snapshotSubPath)) {
-            return self::TYPE_DIR;
-        }
-        $snapshotObjectInfos = $this->resticRepository->ls($snapshotId);
-        $snapshotFileOrDir = $snapshotObjectInfos[$snapshotSubPath] ?? false;
-        // Get type from restic metadata
-        if ($snapshotFileOrDir !== false) {
-            if ($snapshotFileOrDir['type'] === 'dir') {
+
+        return CacheUtil::getCached("type_$path", $this->resultsCache, function () use ($path) {
+            [$snapshotId, $snapshotSubPath] = $this->parsePath($path);
+            // A snapshot root is always a directory
+            if (empty($snapshotSubPath)) {
                 return self::TYPE_DIR;
             }
-            if ($snapshotFileOrDir['type'] === 'file') {
-                return self::TYPE_FILE;
+            $snapshotObjectInfos = $this->resticRepository->ls($snapshotId, $snapshotSubPath);
+            $snapshotFileOrDir = $snapshotObjectInfos[$snapshotSubPath] ?? false;
+            // Get type from restic metadata
+            if ($snapshotFileOrDir !== false) {
+                if ($snapshotFileOrDir['type'] === 'dir') {
+                    return self::TYPE_DIR;
+                }
+                if ($snapshotFileOrDir['type'] === 'file') {
+                    return self::TYPE_FILE;
+                }
             }
-        }
-        return self::TYPE_UNKNOWN;
+            return self::TYPE_UNKNOWN;
+        });
     }
 
     private function normalizePath(string $path) : string {

@@ -16,12 +16,6 @@
     <category>files</category>
     <bugs>https://github.com/R0Wi</bugs>
     <dependencies>
-        <nextcloud min-version="25" max-version="25"/>
+        <nextcloud min-version="27" max-version="27"/>
     </dependencies>
-    <!--<navigations>
-        <navigation>
-            <name>Restic Browser</name>
-            <route>resticbrowser.page.index</route>
-        </navigation>
-    </navigations>-->
 </info>

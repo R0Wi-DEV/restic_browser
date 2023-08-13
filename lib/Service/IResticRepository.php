@@ -42,7 +42,8 @@ interface IResticRepository {
     /**
      * Returns an array of snapshot info objects. 
      * The array is structured as follows:
-     * "/my/path/file.txt" => [ 
+     * [
+     *  "/my/path/file.txt" => [ 
      *      "name":"file.txt",
      *      "type":"file",
      *      "path":"/my/path/file.txt",
@@ -55,11 +56,14 @@ interface IResticRepository {
      *      "atime":"2018-02-22T19:35:46+01:00",
      *      "ctime":"2022-09-21T17:06:45.689362911+02:00",
      *      "struct_type":"node" 
+     *  ],
+     *  "/my/path/folder" =>  ...
      * ]
      * @param string $snapshotId Restic snapshot id
+     * @param string $snapshotPath Subpath of the snapshot object to list (usually the folder which should be listed)
      * @return array
      */
-    public function ls(string $snapshotId): array;
+    public function ls(string $snapshotId, string $snapshotPath): array;
 
     /**
      * Dumps the contents of a snapshot to a file or folder.
