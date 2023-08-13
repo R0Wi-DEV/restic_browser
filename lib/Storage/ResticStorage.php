@@ -52,6 +52,9 @@ class ResticStorage extends Common {
     private $resticRepository;
 
     public function __construct($params) {
+        parent::__construct([
+            'datadir' => 'non-existing-path',
+        ]);
         $password = $params['password'];
         $path = $params['path'];
         $this->logger = Server::get(LoggerInterface::class);
@@ -85,7 +88,7 @@ class ResticStorage extends Common {
             // Use a regex which matches the path as prefix and returns
             // the next path component as group-match
             $regexFilesInSubPath = "/$snapshotSubPathEscaped\/(.*?)(\/|$)/";
-            $snapshotObjectInfos = $this->resticRepository->ls($snapshotId, $snapshotSubPath);
+            $snapshotObjectInfos = $this->listFiles($snapshotId, $snapshotSubPath);
             foreach ($snapshotObjectInfos as $snapshotObjectInfo) {
                 $snapshotFilePath = $snapshotObjectInfo['path'];
                 $matchingFileOrDirectory = preg_match($regexFilesInSubPath, $snapshotFilePath, $subPathMatch) ? $subPathMatch[1] : null;
@@ -125,37 +128,43 @@ class ResticStorage extends Common {
             return $this->getDefaultStat();
         }
 
-        return CacheUtil::getCached("stat_$path", $this->resultsCache, function () use ($path) {
-            [$snapshotId, $snapshotSubPath] = $this->parsePath($path);
+        [$snapshotId, $snapshotSubPath] = $this->parsePath($path);
 
-            // Snapshot metadata
-            if (empty($snapshotSubPath)) {
-                $snapshots = $this->resticRepository->snapshots();
-                if (!array_key_exists($snapshotId, $snapshots)) {
-                    return $this->getDefaultStat();
-                }
-                $snapshotMeta = $snapshots[$snapshotId];
-                $snapshotTime = strtotime($snapshotMeta['time']);
-                return [
-                    'size' => 0,
-                    'mtime' => $snapshotTime,
-                    'atime' => $snapshotTime
-                ];
+        // Snapshot metadata
+        if (empty($snapshotSubPath)) {
+            $snapshots = $this->resticRepository->snapshots();
+            if (!array_key_exists($snapshotId, $snapshots)) {
+                return $this->getDefaultStat();
             }
-    
-            // Metadata of backed up file/folder
-            $snapshotObjectInfos = $this->resticRepository->ls($snapshotId, $snapshotSubPath);
+            $snapshotMeta = $snapshots[$snapshotId];
+            $snapshotTime = strtotime($snapshotMeta['time']);
+            return [
+                'size' => 0,
+                'mtime' => $snapshotTime,
+                'atime' => $snapshotTime
+            ];
+        }
+
+        // Check if we cached the node info already
+        $snapshotObjectInfo = $this->getCachedNodeInfo($snapshotId, $snapshotSubPath);
+
+        // Read metadata of backed up file/folder
+        if ($snapshotObjectInfo === null) {
+            $snapshotObjectInfos = $this->listFiles($snapshotId, $snapshotSubPath);
             if (!array_key_exists($snapshotSubPath, $snapshotObjectInfos)) {
                 return $this->getDefaultStat();
             }
-    
+
             $snapshotObjectInfo = $snapshotObjectInfos[$snapshotSubPath];
-            return [
-                'size' => intval($snapshotObjectInfo['size']),
-                'mtime' => strtotime($snapshotObjectInfo['mtime']),
-                'atime' => strtotime($snapshotObjectInfo['atime'])
-            ];
-        });
+        }
+
+        $size = array_key_exists('size', $snapshotObjectInfo) ? $snapshotObjectInfo['size'] : 0;
+        
+        return [
+            'size' => intval($size),
+            'mtime' => strtotime($snapshotObjectInfo['mtime']),
+            'atime' => strtotime($snapshotObjectInfo['atime'])
+        ];
     }
 
     public function filetype($path) {
@@ -215,6 +224,20 @@ class ResticStorage extends Common {
         }, $snapshots);
     }
 
+    /**
+     * Executes a restic ls command and caches the individual result rows by path.
+     * @param string $snapshotId
+     * @param string $snapshotSubPath
+     * @return array The result of ResticRepository::ls()
+     */
+    private function listFiles(string $snapshotId, string $snapshotSubPath): array {
+        $snapshotObjectInfos = $this->resticRepository->ls($snapshotId, $snapshotSubPath);
+        foreach($snapshotObjectInfos as $path => $snapshotObjectInfo) {
+            $this->setCachedNodeInfo($snapshotId, $path, $snapshotObjectInfo);
+        }
+        return $snapshotObjectInfos;
+    }
+
     private function parsePath(string $path) : array {
         // We built our path like this:
         // 2023-04-15T23:39:39.095734241+02:00 (52f058e0)/path/to/file.png
@@ -234,25 +257,31 @@ class ResticStorage extends Common {
             return self::TYPE_DIR;
         }
 
-        return CacheUtil::getCached("type_$path", $this->resultsCache, function () use ($path) {
-            [$snapshotId, $snapshotSubPath] = $this->parsePath($path);
-            // A snapshot root is always a directory
-            if (empty($snapshotSubPath)) {
+        [$snapshotId, $snapshotSubPath] = $this->parsePath($path);
+        // A snapshot root is always a directory
+        if (empty($snapshotSubPath)) {
+            return self::TYPE_DIR;
+        }
+
+        // Check cached node info
+        $snapshotFileOrDir = $this->getCachedNodeInfo($snapshotId, $snapshotSubPath);
+        
+        // Check type via restic ls
+        if ($snapshotFileOrDir === null) {
+            $snapshotObjectInfos = $this->listFiles($snapshotId, $snapshotSubPath);
+            $snapshotFileOrDir = array_key_exists($snapshotObjectInfos, $snapshotSubPath) ? $snapshotObjectInfos[$snapshotSubPath] : false;
+        }
+
+        // Get type from restic metadata
+        if ($snapshotFileOrDir !== false) {
+            if ($snapshotFileOrDir['type'] === 'dir') {
                 return self::TYPE_DIR;
             }
-            $snapshotObjectInfos = $this->resticRepository->ls($snapshotId, $snapshotSubPath);
-            $snapshotFileOrDir = $snapshotObjectInfos[$snapshotSubPath] ?? false;
-            // Get type from restic metadata
-            if ($snapshotFileOrDir !== false) {
-                if ($snapshotFileOrDir['type'] === 'dir') {
-                    return self::TYPE_DIR;
-                }
-                if ($snapshotFileOrDir['type'] === 'file') {
-                    return self::TYPE_FILE;
-                }
+            if ($snapshotFileOrDir['type'] === 'file') {
+                return self::TYPE_FILE;
             }
-            return self::TYPE_UNKNOWN;
-        });
+        }
+        return self::TYPE_UNKNOWN;
     }
 
     private function normalizePath(string $path) : string {
@@ -266,5 +295,41 @@ class ResticStorage extends Common {
             'mtime' => time(),
             'atime' => time()
         ];
+    }
+
+    /**
+     * Returns the entry of ResticRepository->ls() for the given node if it exists.
+     * Array will have this form:
+     * [
+     *      "name":"file.txt",
+     *      "type":"file",
+     *      "path":"/my/path/file.txt",
+     *      "uid":1000,
+     *      "gid":1000,
+     *      "size":80,
+     *      "mode":436,
+     *      "permissions":"-rw-rw-r--",
+     *      "mtime":"2018-02-22T19:35:46+01:00",
+     *      "atime":"2018-02-22T19:35:46+01:00",
+     *      "ctime":"2022-09-21T17:06:45.689362911+02:00",
+     *      "struct_type":"node"
+     * ]
+     * @param string $snapshotId
+     * @param string $snapshotSubPath
+     */
+    private function getCachedNodeInfo(string $snapshotId, string $snapshotSubPath) : ?array {
+        return $this->resultsCache->get(self::getNodeInfoCacheKey($snapshotId, $snapshotSubPath));
+    }
+
+    /**
+     * @param string $snapshotId
+     * @param string $snapshotSubPath
+     */
+    private function setCachedNodeInfo(string $snapshotId, string $snapshotSubPath, array $nodeInfo) : void {
+        $this->resultsCache->set(self::getNodeInfoCacheKey($snapshotId, $snapshotSubPath), $nodeInfo);
+    }
+
+    private static function getNodeInfoCacheKey(string $snapshotId, string $snapshotSubPath) : string {
+        return "nodeinfo_$snapshotId" . "_$snapshotSubPath";
     }
 }

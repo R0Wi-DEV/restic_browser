@@ -59,7 +59,7 @@ class ResticRepository implements IResticRepository {
     public function snapshots(): array {
         // Snapshot numbers can change so only cache for a short period of time
         return CacheUtil::getCached("snapshots", $this->cache, function() {
-            [$stdOut, $stdErr, $returnCode] = $this->executeResticCommand("snapshots --json");
+            $stdOut = $this->executeResticCommand("snapshots --json");
             $snapshots = json_decode($stdOut, true);
             $result = [];
             foreach ($snapshots as $snapshot) {
@@ -80,7 +80,7 @@ class ResticRepository implements IResticRepository {
                 $snapshotPath = '/' . $snapshotPath;
             }
             $cmd = 'ls ' . escapeshellarg($snapshotId) . ' ' . escapeshellarg($snapshotPath) . ' --json';
-            [$stdOut, $stdErr, $returnCode] = $this->executeResticCommand($cmd);
+            $stdOut = $this->executeResticCommand($cmd);
             $snapshotObjects = [];
             $lineCount = 0;
             foreach (explode("\n", $stdOut) as $line) {
@@ -100,13 +100,15 @@ class ResticRepository implements IResticRepository {
 
     public function dump(string $snapshotId, string $snapshotPath, string $target): void {
         $cmd = 'dump ' . escapeshellarg($snapshotId). ' ' . escapeshellarg($snapshotPath) . ' > ' . escapeshellarg($target);
-        [$stdOut, $stdErr, $returnCode] = $this->executeResticCommand($cmd);
+        $this->executeResticCommand($cmd);
     }
 
     /**
-     * Returns [stdout, stderr, returncode]
+     * Executes the restic command and provides the password via stdin.
+     * Returns the stdout of the command.
+     * @param string $commandSuffix
      */
-    private function executeResticCommand(string $commandSuffix): array {
+    private function executeResticCommand(string $commandSuffix): string {
         $descriptorspec = array(
             0 => array("pipe", "r"),    // stdin 
             1 => array("pipe", "w"),    // stdout 
@@ -139,7 +141,13 @@ class ResticRepository implements IResticRepository {
                 throw new ResticException('Command failed: ' . $command . '. Stderr was: ' . $stdErr . ' (return code: ' . $returnCode . ')');
             }
 
-            return [$stdOut, $stdErr, $returnCode];
+            // TODO ::
+            // unable to open cache: unable to locate cache directory: neither $XDG_CACHE_HOME nor $HOME are defined
+            // if ($stdErr !== '') {
+            //     $this->logger->warning('Command returned stderr: ' . $stdErr);
+            // }
+
+            return $stdOut;
         }
         catch (\Throwable $e) {
             $this->logger->error('Error executing command: ' . $command . '. Error was: ' . $e->getMessage());
